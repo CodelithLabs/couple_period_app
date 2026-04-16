@@ -1,0 +1,162 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isPartnerOf(userId) {
+      return isSignedIn() &&
+        get(/databases/$(database)/documents/users/$(userId)).data.partnerId == request.auth.uid;
+    }
+
+    function partnerSharesCycle(userId) {
+      return isPartnerOf(userId) &&
+        get(/databases/$(database)/documents/users/$(userId)/partner_settings/preferences)
+          .data.shareCyclePhase == true;
+    }
+
+    function partnerSharesMood(userId) {
+      return isPartnerOf(userId) &&
+        get(/databases/$(database)/documents/users/$(userId)/partner_settings/preferences)
+          .data.shareMood == true;
+    }
+
+    function isCoupleMember(coupleId) {
+      return isSignedIn() &&
+        (
+          get(/databases/$(database)/documents/couples/$(coupleId)).data.user1 == request.auth.uid ||
+          get(/databases/$(database)/documents/couples/$(coupleId)).data.user2 == request.auth.uid
+        );
+    }
+
+    function canLinkOtherUserToSelf(userId) {
+      return isSignedIn() &&
+        !isSelf(userId) &&
+        resource.data.partnerId == null &&
+        request.resource.data.partnerId == request.auth.uid &&
+        request.resource.data.mode == 'couple' &&
+        request.resource.data.coupleId is string &&
+        request.resource.data.updatedAt == request.time &&
+        request.resource.data.diff(resource.data).changedKeys()
+          .hasOnly(['partnerId', 'mode', 'coupleId', 'updatedAt']) &&
+        getAfter(/databases/$(database)/documents/couples/$(request.resource.data.coupleId)).data.user1 == userId &&
+        getAfter(/databases/$(database)/documents/couples/$(request.resource.data.coupleId)).data.user2 == request.auth.uid &&
+        getAfter(/databases/$(database)/documents/couples/$(request.resource.data.coupleId)).data.status == 'active';
+    }
+
+    function canDisconnectPartnerUser(userId) {
+      return isSignedIn() &&
+        !isSelf(userId) &&
+        resource.data.partnerId == request.auth.uid &&
+        resource.data.coupleId is string &&
+        request.resource.data.partnerId == null &&
+        request.resource.data.coupleId == null &&
+        request.resource.data.mode == 'solo' &&
+        request.resource.data.updatedAt == request.time &&
+        request.resource.data.diff(resource.data).changedKeys()
+          .hasOnly(['partnerId', 'mode', 'coupleId', 'updatedAt']) &&
+        getAfter(/databases/$(database)/documents/couples/$(resource.data.coupleId)).data.status == 'disconnected' &&
+        getAfter(/databases/$(database)/documents/couples/$(resource.data.coupleId)).data.disconnectedBy == request.auth.uid;
+    }
+
+    function canRedeemInvite() {
+      return isSignedIn() &&
+        resource.data.ownerUserId != request.auth.uid &&
+        resource.data.used == false &&
+        (
+          !(resource.data.expiresAt is timestamp) ||
+          resource.data.expiresAt > request.time
+        ) &&
+        request.resource.data.used == true &&
+        request.resource.data.usedBy == request.auth.uid &&
+        request.resource.data.usedAt == request.time &&
+        request.resource.data.coupleId is string &&
+        request.resource.data.diff(resource.data).changedKeys()
+          .hasOnly(['used', 'usedBy', 'usedAt', 'coupleId']) &&
+        getAfter(/databases/$(database)/documents/couples/$(request.resource.data.coupleId)).data.user1 == resource.data.ownerUserId &&
+        getAfter(/databases/$(database)/documents/couples/$(request.resource.data.coupleId)).data.user2 == request.auth.uid &&
+        getAfter(/databases/$(database)/documents/couples/$(request.resource.data.coupleId)).data.status == 'active';
+    }
+
+    function canDisconnectCouple(coupleId) {
+      return isCoupleMember(coupleId) &&
+        resource.data.status == 'active' &&
+        request.resource.data.status == 'disconnected' &&
+        request.resource.data.user1 == resource.data.user1 &&
+        request.resource.data.user2 == resource.data.user2 &&
+        request.resource.data.disconnectedBy == request.auth.uid &&
+        request.resource.data.disconnectedAt == request.time &&
+        request.resource.data.updatedAt == request.time &&
+        request.resource.data.diff(resource.data).changedKeys()
+          .hasOnly(['status', 'disconnectedBy', 'disconnectedAt', 'updatedAt']);
+    }
+
+    match /users/{userId} {
+      allow read: if isSelf(userId) || isPartnerOf(userId);
+      allow create: if isSelf(userId);
+      allow update: if isSelf(userId) || canLinkOtherUserToSelf(userId) || canDisconnectPartnerUser(userId);
+      allow delete: if false;
+
+      match /cycles/{docId} {
+        allow read: if isSelf(userId) || partnerSharesCycle(userId);
+        allow write: if isSelf(userId);
+      }
+
+      match /moods/{docId} {
+        allow read: if isSelf(userId) || partnerSharesMood(userId);
+        allow write: if isSelf(userId);
+
+        match /logs/{logId} {
+          allow read: if isSelf(userId) || partnerSharesMood(userId);
+          allow write: if isSelf(userId);
+        }
+      }
+
+      match /partner_settings/{docId} {
+        allow read: if isSelf(userId) || isPartnerOf(userId);
+        allow write: if isSelf(userId);
+      }
+
+      match /private_notes/{docId} {
+        allow read, write: if isSelf(userId);
+      }
+    }
+
+    match /invite_codes/{code} {
+      allow get, list: if isSignedIn();
+      allow create: if isSignedIn() &&
+        request.resource.data.ownerUserId == request.auth.uid &&
+        request.resource.data.used == false &&
+        request.resource.data.createdAt == request.time &&
+        request.resource.data.expiresAt is timestamp &&
+        request.resource.data.keys().hasOnly(['ownerUserId', 'used', 'createdAt', 'expiresAt']);
+      allow update: if canRedeemInvite();
+      allow delete: if false;
+    }
+
+    match /couples/{coupleId} {
+      allow read: if isCoupleMember(coupleId);
+      allow create: if isSignedIn() &&
+        request.resource.data.user1 is string &&
+        request.resource.data.user2 == request.auth.uid &&
+        request.resource.data.user1 != request.auth.uid &&
+        request.resource.data.status == 'active' &&
+        request.resource.data.createdAt == request.time &&
+        request.resource.data.updatedAt == request.time &&
+        request.resource.data.keys().hasOnly([
+          'user1',
+          'user2',
+          'status',
+          'createdAt',
+          'updatedAt',
+        ]);
+      allow update: if canDisconnectCouple(coupleId);
+      allow delete: if false;
+    }
+  }
+}
